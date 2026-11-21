@@ -48,11 +48,7 @@ func SubscribeLSPEvents(ctx context.Context) <-chan pubsub.Event[LSPEvent] {
 
 // GetLSPStates returns the current state of all LSP clients
 func GetLSPStates() map[string]LSPClientInfo {
-	states := make(map[string]LSPClientInfo)
-	for name, info := range lspStates.Seq2() {
-		states[name] = info
-	}
-	return states
+	return lspStates.Copy()
 }
 
 // GetLSPState returns the state of a specific LSP client
@@ -71,6 +67,8 @@ func updateLSPState(name string, state lsp.ServerState, err error, client *lsp.C
 	}
 	if state == lsp.StateReady {
 		info.ConnectedAt = time.Now()
+	} else if existing, ok := lspStates.Get(name); ok {
+		info.ConnectedAt = existing.ConnectedAt
 	}
 	lspStates.Set(name, info)
 

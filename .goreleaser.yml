@@ -4,15 +4,24 @@ version: 2
 
 project_name: crush
 
-includes:
-  - from_url:
-      url: charmbracelet/meta/main/notarize.yaml
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      sign:
+        certificate: "{{.Env.MACOS_SIGN_P12}}"
+        password: "{{.Env.MACOS_SIGN_PASSWORD}}"
+        entitlements: '{{ envOrDefault "MACOS_SIGN_ENTITLEMENTS" "" }}'
+      notarize:
+        issuer_id: "{{.Env.MACOS_NOTARY_ISSUER_ID}}"
+        key_id: "{{.Env.MACOS_NOTARY_KEY_ID}}"
+        key: "{{.Env.MACOS_NOTARY_KEY}}"
 
 metadata:
   mod_timestamp: "{{ .CommitTimestamp }}"
   license: "FSL-1.1-MIT"
   homepage: "https://charm.sh/crush"
   description: "A powerful terminal-based AI assistant for developers, providing intelligent coding assistance directly in your terminal."
+  full_description: "A powerful terminal-based AI assistant for developers, providing intelligent coding assistance directly in your terminal."
   maintainers:
     - "kujtimiihoxha <kujtim@charm.sh>"
     - "caarlos0 <carlos@charm.sh>" # for aur
@@ -43,6 +52,7 @@ before:
 builds:
   - env:
       - CGO_ENABLED=0
+      - GOEXPERIMENT=greenteagc
     goos:
       - linux
       - darwin
@@ -50,6 +60,7 @@ builds:
       - freebsd
       - openbsd
       - netbsd
+      - android
     goarch:
       - amd64
       - arm64
@@ -57,8 +68,19 @@ builds:
       - arm
     goarm:
       - "7"
+    ignore:
+      - goos: android
+        goarch: amd64
+      - goos: android
+        goarch: arm
+      - goos: android
+        goarch: "386"
+      - goos: windows
+        goarch: arm
     ldflags:
       - -s -w -X github.com/charmbracelet/crush/internal/version.Version={{.Version}}
+    flags:
+      - -trimpath
 
 archives:
   - name_template: >-
@@ -84,7 +106,11 @@ checksum:
 
 aur_sources:
   - private_key: "{{ .Env.AUR_KEY }}"
+    disable: "{{ with .Prerelease }}true{{ end }}"
     git_url: "ssh://aur@aur.archlinux.org/crush.git"
+    commit_author:
+      name: "Charm"
+      email: "charmcli@users.noreply.github.com"
     makedepends:
       - go
       - git
@@ -98,7 +124,7 @@ aur_sources:
       export CGO_CXXFLAGS="${CXXFLAGS}"
       export CGO_LDFLAGS="${LDFLAGS}"
       export GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw"
-      go build -ldflags="-w -s -buildid='' -linkmode=external -X main.version=v${pkgver}" .
+      go build -ldflags="-w -s -buildid='' -linkmode=external -X github.com/charmbracelet/crush/internal/version.Version=v${pkgver}" .
       ./crush completion bash >./completions/crush.bash
       ./crush completion zsh >./completions/crush.zsh
       ./crush completion fish >./completions/crush.fish
@@ -124,13 +150,24 @@ aur_sources:
 
 aurs:
   - private_key: "{{ .Env.AUR_KEY }}"
+    disable: "{{ with .Prerelease }}true{{ end }}"
     git_url: "ssh://aur@aur.archlinux.org/crush-bin.git"
+    commit_author:
+      name: "Charm"
+      email: "charmcli@users.noreply.github.com"
     provides:
       - crush
     conflicts:
       - crush
     package: |-
-      cd "${srcdir}/crush_${pkgver}_Linux_${CARCH}"
+      case "$CARCH" in
+        aarch64)
+          cd "${srcdir}/crush_${pkgver}_Linux_arm64"
+          ;;
+        *)
+          cd "${srcdir}/crush_${pkgver}_Linux_${CARCH}"
+          ;;
+      esac
       # bin
       install -Dm755 "./crush" "${pkgdir}/usr/bin/crush"
       # license
@@ -150,7 +187,7 @@ aurs:
       install -Dm644 README* "${pkgdir}/usr/share/doc/crush/"
 
 furies:
-  - disable: "{{ .IsNightly }}"
+  - disable: "{{ if (or .Prerelease .IsNightly) }}true{{ end }}"
     account: "{{ with .Env.FURY_TOKEN }}charmcli{{ else }}{{ end }}"
     secret_name: FURY_TOKEN
 
@@ -159,6 +196,10 @@ brews:
       owner: charmbracelet
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    skip_upload: "{{ with .Prerelease }}true{{ end }}"
+    commit_author:
+      name: "Charm"
+      email: "charmcli@users.noreply.github.com"
     goarm: 7
     extra_install: |-
       bash_completion.install "completions/{{ .ProjectName }}.bash" => "{{ .ProjectName }}"
@@ -171,12 +212,17 @@ scoops:
       owner: charmbracelet
       name: scoop-bucket
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    skip_upload: "{{ with .Prerelease }}true{{ end }}"
+    commit_author:
+      name: "Charm"
+      email: "charmcli@users.noreply.github.com"
 
 npms:
   - name: "@charmland/crush"
     repository: "git+https://github.com/charmbracelet/crush.git"
     bugs: https://github.com/charmbracelet/crush/issues
     access: public
+    disable: "{{ with .Prerelease }}true{{ end }}"
 
 nfpms:
   - formats:
@@ -187,13 +233,13 @@ nfpms:
     file_name_template: "{{ .ConventionalFileName }}"
     contents:
       - src: ./completions/crush.bash
-        dst: /etc/bash_completion.d/crush
+        dst: '{{ if eq .Format "termux.deb" }}/data/data/com.termux/files/usr{{ end }}/etc/bash_completion.d/crush'
       - src: ./completions/crush.fish
-        dst: /usr/share/fish/vendor_completions.d/crush.fish
+        dst: '{{ if eq .Format "termux.deb" }}/data/data/com.termux/files{{ end }}/usr/share/fish/vendor_completions.d/crush.fish'
       - src: ./completions/crush.zsh
-        dst: /usr/share/zsh/site-functions/_crush
+        dst: '{{ if eq .Format "termux.deb" }}/data/data/com.termux/files{{ end }}/usr/share/zsh/site-functions/_crush'
       - src: ./manpages/crush.1.gz
-        dst: /usr/share/man/man1/crush.1.gz
+        dst: '{{ if eq .Format "termux.deb" }}/data/data/com.termux/files{{ end }}/usr/share/man/man1/crush.1.gz'
     rpm:
       signature:
         key_file: '{{ if ne (index .Env "GPG_KEY_PATH") "" }}{{ .Env.GPG_KEY_PATH }}{{ else }}{{ end }}'
@@ -203,11 +249,10 @@ nfpms:
 
 signs:
   - cmd: cosign
-    certificate: "${artifact}.pem"
+    signature: "${artifact}.sigstore.json"
     args:
       - sign-blob
-      - "--output-certificate=${certificate}"
-      - "--output-signature=${signature}"
+      - "--bundle=${signature}"
       - "${artifact}"
       - "--yes"
     artifacts: checksum
@@ -226,7 +271,12 @@ nix:
       owner: "charmbracelet"
       name: nur
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: "Charm"
+      email: "charmcli@users.noreply.github.com"
     license: fsl11Mit
+    formatter: nixfmt
+    skip_upload: "{{ with .Prerelease }}true{{ end }}"
     extra_install: |-
       installManPage ./manpages/crush.1.gz
       installShellCompletion ./completions/*
@@ -234,6 +284,13 @@ nix:
 winget:
   - publisher: charmbracelet
     copyright: Charmbracelet, Inc
+    publisher_url: https://charm.land
+    release_notes_url: "https://github.com/charmbracelet/crush/releases/tag/{{.Tag}}"
+    license_url: https://github.com/charmbracelet/crush/blob/main/LICENSE.md
+    skip_upload: "{{ with .Prerelease }}true{{ end }}"
+    commit_author:
+      name: "Charm"
+      email: "charmcli@users.noreply.github.com"
     repository:
       owner: "charmbracelet"
       name: winget-pkgs
@@ -247,6 +304,8 @@ winget:
           owner: microsoft
           name: winget-pkgs
           branch: master
+        body: |
+          /cc @andreynering
 
 changelog:
   sort: asc
@@ -267,6 +326,7 @@ changelog:
       - "^docs: update$"
       - "^test:"
       - "^test\\("
+      - "^v\\d.*"
       - "merge conflict"
       - "merge conflict"
       - Merge branch
@@ -276,23 +336,56 @@ changelog:
       - "^wip "
       - "^wip:"
   groups:
-    - title: "New Features"
-      regexp: '^.*?feat(\(.+\))??!?:.+$'
+    - title: "Deps"
+      regexp: "^.*\\(deps\\)*:+.*$"
+      order: 300
+    - title: "New!"
+      regexp: "^.*feat[(\\w)]*:+.*$"
       order: 100
-    - title: "Security updates"
-      regexp: '^.*?sec(\(.+\))??!?:.+$'
-      order: 150
-    - title: "Bug fixes and improvements"
-      regexp: '^.*?(fix|refactor)(\(.+\))??!?:.+$'
+    - title: "Fixed"
+      regexp: "^.*fix[(\\w)]*:+.*$"
       order: 200
-    - title: "Documentation updates"
-      regexp: ^.*?docs?(\(.+\))??!?:.+$
+    - title: "Docs"
+      regexp: "^.*docs[(\\w)]*:+.*$"
       order: 400
-    - title: Other work
+    - title: "Other stuff"
       order: 9999
 
 release:
   prerelease: auto
-  footer:
-    from_url:
-      url: https://raw.githubusercontent.com/charmbracelet/meta/main/footer.md
+  footer: |-
+    ---
+
+    <details>
+    <summary>Verifying the artifacts</summary>
+
+    First, download the [`checksums.txt` file](https://github.com/charmbracelet/{{.ProjectName}}/releases/download/{{.Tag}}/checksums.txt) and the [`checksums.txt.sigstore.json` file](https://github.com/charmbracelet/{{.ProjectName}}/releases/download/{{.Tag}}/checksums.txt.sigstore.json) files, for example, with `wget`:
+
+    ```bash
+    wget 'https://github.com/charmbracelet/{{.ProjectName}}/releases/download/{{.Tag}}/checksums.txt'
+    wget 'https://github.com/charmbracelet/{{.ProjectName}}/releases/download/{{.Tag}}/checksums.txt.sigstore.json'
+    ```
+
+    Then, verify it using [`cosign`](https://github.com/sigstore/cosign):
+
+    ```bash
+    cosign verify-blob \
+      --certificate-identity-regexp '^https://github.com/charmbracelet/crush/\.github/workflows/(release|nightly)\.yml@' \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      --bundle 'checksums.txt.sigstore.json' \
+      ./checksums.txt
+    ```
+
+    If the output is `Verified OK`, you can safely use it to verify the checksums of other artifacts you downloaded from the release using `sha256sum`:
+
+    ```bash
+    sha256sum --ignore-missing -c checksums.txt
+    ```
+
+    Done! You artifacts are now verified!
+
+    </details>
+
+    <a href="https://charm.land/"><img alt="The Charm logo" src="https://stuff.charm.sh/charm-banner-next.jpg" width="400"></a>
+
+    Thoughts? Questions? We love hearing from you. Feel free to reach out on [X](https://x.com/charmcli), [Discord](https://charm.land/discord), [Slack](https://charm.land/slack), [The Fediverse](https://mastodon.social/@charmcli), [Bluesky](https://bsky.app/profile/charm.land).

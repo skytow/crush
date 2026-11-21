@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
-	tea "github.com/charmbracelet/bubbletea/v2"
-	"github.com/charmbracelet/crush/internal/tui/components/anim"
-	"github.com/charmbracelet/crush/internal/tui/styles"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -23,8 +23,14 @@ type model struct {
 	anim   *anim.Anim
 }
 
-func (m model) Init() tea.Cmd { return m.anim.Init() }
-func (m model) View() string  { return m.anim.View() }
+type tickMsg struct{}
+
+func tick() tea.Cmd {
+	return tea.Tick(anim.FrameInterval(), func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+func (m model) Init() tea.Cmd  { return tick() }
+func (m model) View() tea.View { return tea.NewView(m.anim.Render()) }
 
 // Update implements tea.Model.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -35,35 +41,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancel()
 			return m, tea.Quit
 		}
+	case tickMsg:
+		m.anim.Advance()
+		return m, tick()
 	}
-	mm, cmd := m.anim.Update(msg)
-	m.anim = mm.(*anim.Anim)
-	return m, cmd
+	return m, nil
 }
 
 // NewSpinner creates a new spinner with the given message
-func NewSpinner(ctx context.Context, cancel context.CancelFunc, message string) *Spinner {
-	t := styles.CurrentTheme()
-	model := model{
-		anim: anim.New(anim.Settings{
-			Size:        10,
-			Label:       message,
-			LabelColor:  t.FgBase,
-			GradColorA:  t.Primary,
-			GradColorB:  t.Secondary,
-			CycleColors: true,
-		}),
+func NewSpinner(ctx context.Context, cancel context.CancelFunc, animSettings anim.Settings) *Spinner {
+	m := model{
+		anim:   anim.New(animSettings),
 		cancel: cancel,
 	}
 
-	prog := tea.NewProgram(
-		model,
-		tea.WithOutput(os.Stderr),
-		tea.WithContext(ctx),
-	)
+	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithContext(ctx))
 
 	return &Spinner{
-		prog: prog,
+		prog: p,
 		done: make(chan struct{}, 1),
 	}
 }

@@ -1,0 +1,375 @@
+package model
+
+// Memoized workspace state.
+//
+// In client/server mode every workspace probe (busy checks, permission mode,
+// queued prompts, agent readiness/model, LSP state) is a synchronous HTTP
+// round-trip, and the Update goroutine is the render loop — blocking it
+// freezes typing. The UI therefore never probes the workspace synchronously
+// from Update or View. (The constructor is the one carve-out: New seeds the
+// yolo and ready/model caches synchronously so the first frame has values to
+// render; Init then refreshes them off-thread.)
+//
+//   - Reads (isAgentBusy, permModeCached, promptQueue, selectedLargeModel,
+//     lspInfo) always return the memoized value, stale or not.
+//   - State edges (message created, agent finished/errored, prompt
+//     submitted, cancel, session switch, yolo toggle, model change, LSP
+//     events) invalidate or write through the caches and dispatch an
+//     off-thread refresh cmd.
+//   - A TTL backstop at the end of Update re-dispatches a refresh whenever
+//     the memoized state has gone stale, so unrelated churn (typing,
+//     resize storms, spinner ticks) only ever schedules async work.
+//
+// Fresh values arrive as busyStateMsg / promptQueueMsg / lspStatesMsg and
+// are applied on the Update goroutine, per the UI guidelines (no IO in
+// Update, no model mutation inside commands).
+
+import (
+	"slices"
+	"time"
+
+	"github.com/charmbracelet/crush/internal/message"
+
+	tea "charm.land/bubbletea/v2"
+
+	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/workspace"
+)
+
+// busyCacheTTL bounds how long the memoized busy/permission state may go
+// without a re-probe being scheduled. Package var so tests can pin it.
+var busyCacheTTL = 500 * time.Millisecond
+
+// promptQueueTTL is the backstop refresh interval for the queued-prompt
+// state; the queue is otherwise refreshed on event edges.
+var promptQueueTTL = 2 * time.Second
+
+// ttlCache memoizes one boolean workspace probe result.
+type ttlCache struct {
+	val bool
+	at  time.Time
+}
+
+// fresh reports whether the cached value is within its TTL.
+func (c *ttlCache) fresh(ttl time.Duration) bool {
+	return !c.at.IsZero() && time.Since(c.at) < ttl
+}
+
+// set writes a known-good value through the cache.
+func (c *ttlCache) set(val bool) {
+	c.val = val
+	c.at = time.Now()
+}
+
+// invalidate marks the value stale so the next Update-tail backstop
+// re-probes; the last value keeps being served in the meantime.
+func (c *ttlCache) invalidate() {
+	c.at = time.Time{}
+}
+
+// modeTTLCache memoizes one permission-mode workspace probe result.
+type modeTTLCache struct {
+	val permission.PermissionMode
+	at  time.Time
+}
+
+// fresh reports whether the cached value is within its TTL.
+func (c *modeTTLCache) fresh(ttl time.Duration) bool {
+	return !c.at.IsZero() && time.Since(c.at) < ttl
+}
+
+// set writes a known-good value through the cache.
+func (c *modeTTLCache) set(val permission.PermissionMode) {
+	c.val = val
+	c.at = time.Now()
+}
+
+// invalidate marks the value stale so the next Update-tail backstop
+// re-probes; the last value keeps being served in the meantime.
+func (c *modeTTLCache) invalidate() {
+	c.at = time.Time{}
+}
+
+// busyStateMsg delivers the result of an off-thread busy/permission probe.
+type busyStateMsg struct {
+	// gen is the busy generation captured when the probe was dispatched.
+	// A result whose generation no longer matches m.busyFetchGen started
+	// before a newer state transition (optimistic send, invalidation,
+	// session switch, ...) and is discarded, then re-fetched, so the
+	// authoritative refresh is never lost to an older in-flight request.
+	gen       uint64
+	ready     bool
+	agentBusy bool
+	permMode  permission.PermissionMode
+	// forSession is the session sessionBusy was probed for.
+	forSession string
+	// sessionBusy reports whether forSession itself has a run in flight,
+	// unlike agentBusy, which any session or shell command sets.
+	sessionBusy bool
+	// model is the coordinator's selected model, fetched by the same probe
+	// so the sidebar/landing model info renders from memoized state. Zero
+	// (and ignored) when ready is false.
+	model workspace.AgentModel
+}
+
+// promptQueueMsg delivers the queued prompts fetched off-thread.
+type promptQueueMsg struct {
+	// forSession is the session the fetch was scoped to; a result that
+	// raced a session switch is discarded and re-fetched.
+	forSession string
+	// gen is the queue generation captured at dispatch; like
+	// busyStateMsg.gen it guards against a stale in-flight result
+	// overwriting newer optimistic or invalidated queue state.
+	gen     uint64
+	prompts []string
+}
+
+// agentRunSubmittedMsg reports whether AgentRun accepted a prompt. A
+// rejected prompt gets no RunComplete, so err must end its turn.
+type agentRunSubmittedMsg struct {
+	sessionID string
+	// pendingID is the optimistic queue entry for the prompt, or zero.
+	pendingID uint64
+	err       error
+}
+
+// agentModelChangedMsg reports that the coordinator's model was updated
+// (model selection, thinking toggle, reasoning effort), so the memoized
+// ready/model state should be re-fetched without waiting for the TTL.
+type agentModelChangedMsg struct{}
+
+// agentModelChangedCmd is sequenced after cmds that call UpdateAgentModel so
+// the refresh probes the coordinator only once the update has completed.
+// Callers should reach for updateAgentModelCmd rather than sequencing this
+// by hand.
+func agentModelChangedCmd() tea.Msg { return agentModelChangedMsg{} }
+
+// currentSessionID returns the active session's ID, or "" when none.
+func (m *UI) currentSessionID() string {
+	if m.session == nil {
+		return ""
+	}
+	return m.session.ID
+}
+
+// invalidateBusyCaches marks all memoized workspace probe state stale and
+// bumps the busy generation so any in-flight probe result is discarded when
+// it lands. Called by handlers for events that change agent or permission
+// state.
+func (m *UI) invalidateBusyCaches() {
+	m.agentBusyCache.invalidate()
+	m.permModeCache.invalidate()
+	m.busyFetchGen++
+}
+
+// invalidatePromptQueue bumps the prompt-queue generation so any in-flight
+// queue fetch result is discarded when it lands (and re-fetched) instead of
+// overwriting newer optimistic or cleared queue state.
+func (m *UI) invalidatePromptQueue() {
+	m.promptQueueGen++
+}
+
+// dispatchBusyRefresh returns a command that probes the workspace busy and
+// permission state off the Update goroutine, delivering a busyStateMsg. It
+// returns nil while a probe is already in flight. The closure captures only
+// locals (never m) so it is safe off-thread; state is applied by
+// applyBusyState on the Update goroutine.
+func (m *UI) dispatchBusyRefresh() tea.Cmd {
+	if m.busyFetchInFlight || m.com == nil || m.com.Workspace == nil {
+		return nil
+	}
+	m.busyFetchInFlight = true
+	ws := m.com.Workspace
+	gen := m.busyFetchGen
+	sessionID := m.currentSessionID()
+	return func() tea.Msg {
+		st := busyStateMsg{gen: gen, forSession: sessionID}
+		if ws.AgentIsReady() {
+			st.ready = true
+			st.agentBusy = ws.AgentIsBusy()
+			st.model = ws.AgentModel()
+			if sessionID != "" {
+				st.sessionBusy = ws.AgentIsSessionBusy(sessionID)
+			}
+		}
+		st.permMode = ws.PermissionMode()
+		return st
+	}
+}
+
+// updateAgentModelCmd sequences a coordinator model rebuild
+// (UpdateAgentModel) with the invalidation of the memoized ready/model
+// state. Callers wrap their pre-work in pre; the memoized model must only
+// be re-probed after the rebuild lands (a synchronous HTTP round-trip in
+// client/server mode), so the message drives the refresh instead of each
+// call site remembering to.
+func (m *UI) updateAgentModelCmd(pre tea.Cmd) tea.Cmd {
+	return tea.Sequence(pre, agentModelChangedCmd)
+}
+
+// applyBusyState stores an off-thread probe result and reacts to busy
+// edges (todo spinner, pills). Runs on the Update goroutine.
+func (m *UI) applyBusyState(msg busyStateMsg) []tea.Cmd {
+	m.busyFetchInFlight = false
+	if msg.gen != m.busyFetchGen {
+		// This probe started before a newer state transition (optimistic
+		// send, invalidation, session switch, ...). Discard its result and
+		// re-dispatch so the required authoritative refresh is not lost
+		// merely because this older request was in flight.
+		if cmd := m.dispatchBusyRefresh(); cmd != nil {
+			return []tea.Cmd{cmd}
+		}
+		return nil
+	}
+	prevBusy := m.isAgentBusy()
+	prevMode := m.permModeCached()
+	m.agentBusyCache.set(msg.agentBusy)
+	m.permModeCache.set(msg.permMode)
+	m.agentReady = msg.ready
+	m.agentModel = msg.model
+	if prevMode != msg.permMode {
+		// A remote/async toggle changed the permission mode: update the
+		// editor prompt function so the prompt icon/style tracks the new
+		// mode. The cache is written above and the placeholder is refreshed
+		// by the Update tail.
+		m.setEditorPrompt(msg.permMode)
+	}
+
+	var cmds []tea.Cmd
+	busy := m.isAgentBusy()
+	if busy {
+		// A session reload that raced an unpopulated busy cache (the
+		// zero-value read at boot) froze the animation clock even though
+		// the agent is working. The authoritative probe re-enables it so
+		// freshly rendered spinners tick. When the probe reports idle the
+		// reload gate stands, keeping ghost spinners still.
+		m.animClock.frozen = false
+	}
+	if m.hasSession() && hasInProgressTodo(m.session.Todos) && busy && !m.todoIsSpinning {
+		m.todoIsSpinning = true
+		cmds = append(cmds, m.todoSpinner.Tick)
+	}
+	if m.todoIsSpinning && !busy {
+		m.todoIsSpinning = false
+	}
+	m.probedSession = msg.forSession
+	m.probedSessionBusy = msg.sessionBusy
+	if prevBusy != busy {
+		m.renderPills()
+	}
+	return cmds
+}
+
+// dispatchPromptQueueRefresh returns a command that fetches the queued
+// prompts off the Update goroutine, delivering a promptQueueMsg. It returns
+// nil while a fetch is already in flight. With no active session the queue
+// is simply cleared.
+func (m *UI) dispatchPromptQueueRefresh() tea.Cmd {
+	if m.promptQueueInFlight || m.com == nil || m.com.Workspace == nil {
+		return nil
+	}
+	if !m.hasSession() {
+		m.promptQueueCheckedAt = time.Now()
+		// Bump the generation so any in-flight fetch scoped to the
+		// now-departed session is discarded rather than repopulating the
+		// queue.
+		m.invalidatePromptQueue()
+		prev := m.promptQueue.Shown()
+		m.promptQueue.Reset()
+		if prev != 0 {
+			m.updateLayoutAndSize()
+		}
+		return nil
+	}
+	m.promptQueueInFlight = true
+	ws := m.com.Workspace
+	sessionID := m.session.ID
+	gen := m.promptQueueGen
+	return func() tea.Msg {
+		msg := promptQueueMsg{forSession: sessionID, gen: gen}
+		if ws.AgentIsReady() {
+			msg.prompts = ws.AgentQueuedPromptsList(sessionID)
+		}
+		return msg
+	}
+}
+
+// applyPromptQueue stores an off-thread queue fetch and re-layouts when the
+// count changed. Runs on the Update goroutine.
+func (m *UI) applyPromptQueue(msg promptQueueMsg) []tea.Cmd {
+	m.promptQueueInFlight = false
+	if msg.forSession != m.currentSessionID() || msg.gen != m.promptQueueGen {
+		// The fetch raced a session switch or a newer queue transition
+		// (submit, clear, invalidation). Discard the stale result and
+		// re-fetch so newer state is not clobbered and the authoritative
+		// refresh is not lost to this older in-flight request.
+		if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+			return []tea.Cmd{cmd}
+		}
+		return nil
+	}
+	m.promptQueueCheckedAt = time.Now()
+	prevItems := m.promptQueue.Items()
+	m.promptQueue.SetFetched(msg.prompts)
+	itemsChanged := !slices.Equal(prevItems, m.promptQueue.Items())
+	countChanged := len(prevItems) != m.promptQueue.Shown()
+	// A report waits in the queue until the model reads it, but its
+	// subagent is already done.
+	for _, prompt := range msg.prompts {
+		if report, ok := message.ParseSubAgentReportPrompt(prompt); ok {
+			m.markDispatchReported(report.Label)
+		}
+	}
+	if countChanged {
+		m.updateLayoutAndSize()
+	} else if itemsChanged {
+		m.renderPills()
+	}
+	return nil
+}
+
+// staleWorkspaceRefreshCmds is the TTL backstop, called at the tail of
+// Update: when any memoized workspace state has outlived its TTL (and no
+// event edge refreshed it), schedule an off-thread re-probe. It never does
+// IO itself — a couple of time comparisons per message at most.
+func (m *UI) staleWorkspaceRefreshCmds() []tea.Cmd {
+	if m.com == nil || m.com.Workspace == nil {
+		return nil
+	}
+	var cmds []tea.Cmd
+	if !m.agentBusyCache.fresh(busyCacheTTL) || !m.permModeCache.fresh(busyCacheTTL) {
+		if cmd := m.dispatchBusyRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if m.hasSession() && time.Since(m.promptQueueCheckedAt) >= promptQueueTTL {
+		if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if time.Since(m.lspCheckedAt) >= lspStatesTTL {
+		if cmd := m.dispatchLSPRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if time.Since(m.mcpCheckedAt) >= mcpStatesTTL {
+		if cmd := m.dispatchMCPRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return cmds
+}
+
+// permModeCached reports the memoized permission mode. Toggles write
+// through the cache; the Update-tail backstop keeps it bounded-stale
+// otherwise.
+func (m *UI) permModeCached() permission.PermissionMode {
+	return m.permModeCache.val
+}
+
+// yoloActive reports whether the memoized permission mode skips permission
+// prompts. Sysadmin skips them too, differing from yolo only in dropping the
+// exec-time block list, which the input-mode cycle has no stake in.
+func (m *UI) yoloActive() bool {
+	return m.permModeCached() != permission.PermissionModeNormal
+}

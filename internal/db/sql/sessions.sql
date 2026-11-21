@@ -28,23 +28,55 @@ SELECT *
 FROM sessions
 WHERE id = ? LIMIT 1;
 
+-- name: GetLastSession :one
+SELECT *
+FROM sessions
+ORDER BY updated_at DESC
+LIMIT 1;
+
 -- name: ListSessions :many
 SELECT *
 FROM sessions
 WHERE parent_session_id is NULL
-ORDER BY created_at DESC;
+ORDER BY updated_at DESC;
 
 -- name: UpdateSession :one
+-- channel is deliberately not written here: SetSessionChannel owns the
+-- binding, so a load-modify-Save cycle with a stale session cannot
+-- clobber the channel the coordinator just set.
 UPDATE sessions
 SET
     title = ?,
     prompt_tokens = ?,
     completion_tokens = ?,
     summary_message_id = ?,
-    cost = ?
+    cost = ?,
+    todos = ?
 WHERE id = ?
 RETURNING *;
 
+-- name: SetSessionChannel :one
+UPDATE sessions
+SET channel = ?
+WHERE id = ?
+RETURNING *;
+
+-- name: UpdateSessionTitleAndUsage :exec
+UPDATE sessions
+SET
+    title = ?,
+    prompt_tokens = prompt_tokens + ?,
+    completion_tokens = completion_tokens + ?,
+    cost = cost + ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;
+
+
+-- name: RenameSession :exec
+UPDATE sessions
+SET
+    title = ?
+WHERE id = ?;
 
 -- name: DeleteSession :exec
 DELETE FROM sessions

@@ -1,9 +1,10 @@
 package shell
 
 import (
-	"context"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestCommandBlocking(t *testing.T) {
@@ -56,10 +57,7 @@ func TestCommandBlocking(t *testing.T) {
 		{
 			name: "block npm global install with -g",
 			blockFuncs: []BlockFunc{
-				ArgumentsBlocker([][]string{
-					{"npm", "install", "-g"},
-					{"npm", "install", "--global"},
-				}),
+				ArgumentsBlocker("npm", []string{"install"}, []string{"-g"}),
 			},
 			command:     "npm install -g typescript",
 			shouldBlock: true,
@@ -67,10 +65,7 @@ func TestCommandBlocking(t *testing.T) {
 		{
 			name: "block npm global install with --global",
 			blockFuncs: []BlockFunc{
-				ArgumentsBlocker([][]string{
-					{"npm", "install", "-g"},
-					{"npm", "install", "--global"},
-				}),
+				ArgumentsBlocker("npm", []string{"install"}, []string{"--global"}),
 			},
 			command:     "npm install --global typescript",
 			shouldBlock: true,
@@ -78,10 +73,8 @@ func TestCommandBlocking(t *testing.T) {
 		{
 			name: "allow npm local install",
 			blockFuncs: []BlockFunc{
-				ArgumentsBlocker([][]string{
-					{"npm", "install", "-g"},
-					{"npm", "install", "--global"},
-				}),
+				ArgumentsBlocker("npm", []string{"install"}, []string{"-g"}),
+				ArgumentsBlocker("npm", []string{"install"}, []string{"--global"}),
 			},
 			command:     "npm install typescript",
 			shouldBlock: false,
@@ -98,21 +91,506 @@ func TestCommandBlocking(t *testing.T) {
 				BlockFuncs: tt.blockFuncs,
 			})
 
-			_, _, err := shell.Exec(context.Background(), tt.command)
+			_, _, err := shell.Exec(t.Context(), tt.command)
 
 			if tt.shouldBlock {
 				if err == nil {
 					t.Errorf("Expected command to be blocked, but it was allowed")
-				} else if !strings.Contains(err.Error(), "not allowed for security reasons") {
+				} else if !strings.Contains(err.Error(), "is a dangerous command") {
 					t.Errorf("Expected security error, got: %v", err)
 				}
 			} else {
 				// For non-blocked commands, we might get other errors (like command not found)
 				// but we shouldn't get the security error
-				if err != nil && strings.Contains(err.Error(), "not allowed for security reasons") {
+				if err != nil && strings.Contains(err.Error(), "is a dangerous command") {
 					t.Errorf("Command was unexpectedly blocked: %v", err)
 				}
 			}
+		})
+	}
+}
+
+func TestArgumentsBlocker(t *testing.T) {
+	tests := []struct {
+		name        string
+		cmd         string
+		args        []string
+		flags       []string
+		input       []string
+		shouldBlock bool
+	}{
+		// Basic command blocking
+		{
+			name:        "block exact command match",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       nil,
+			input:       []string{"npm", "install", "package"},
+			shouldBlock: true,
+		},
+		{
+			name:        "allow different command",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       nil,
+			input:       []string{"yarn", "install", "package"},
+			shouldBlock: false,
+		},
+		{
+			name:        "allow different subcommand",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       nil,
+			input:       []string{"npm", "list"},
+			shouldBlock: false,
+		},
+
+		// Flag-based blocking
+		{
+			name:        "block with single flag",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       []string{"-g"},
+			input:       []string{"npm", "install", "-g", "typescript"},
+			shouldBlock: true,
+		},
+		{
+			name:        "block with flag in different position",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       []string{"-g"},
+			input:       []string{"npm", "install", "typescript", "-g"},
+			shouldBlock: true,
+		},
+		{
+			name:        "allow without required flag",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       []string{"-g"},
+			input:       []string{"npm", "install", "typescript"},
+			shouldBlock: false,
+		},
+		{
+			name:        "block with multiple flags",
+			cmd:         "pip",
+			args:        []string{"install"},
+			flags:       []string{"--user"},
+			input:       []string{"pip", "install", "--user", "--upgrade", "package"},
+			shouldBlock: true,
+		},
+
+		// Complex argument patterns
+		{
+			name:        "block multi-arg subcommand",
+			cmd:         "yarn",
+			args:        []string{"global", "add"},
+			flags:       nil,
+			input:       []string{"yarn", "global", "add", "typescript"},
+			shouldBlock: true,
+		},
+		{
+			name:        "allow partial multi-arg match",
+			cmd:         "yarn",
+			args:        []string{"global", "add"},
+			flags:       nil,
+			input:       []string{"yarn", "global", "list"},
+			shouldBlock: false,
+		},
+
+		// Edge cases
+		{
+			name:        "handle empty input",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       nil,
+			input:       []string{},
+			shouldBlock: false,
+		},
+		{
+			name:        "handle command only",
+			cmd:         "npm",
+			args:        []string{"install"},
+			flags:       nil,
+			input:       []string{"npm"},
+			shouldBlock: false,
+		},
+		{
+			name:        "block pacman with -S flag",
+			cmd:         "pacman",
+			args:        nil,
+			flags:       []string{"-S"},
+			input:       []string{"pacman", "-S", "package"},
+			shouldBlock: true,
+		},
+		{
+			name:        "allow pacman without -S flag",
+			cmd:         "pacman",
+			args:        nil,
+			flags:       []string{"-S"},
+			input:       []string{"pacman", "-Q", "package"},
+			shouldBlock: false,
+		},
+
+		// `go test -exec`
+		{
+			name:        "go test exec",
+			cmd:         "go",
+			args:        []string{"test"},
+			flags:       []string{"-exec"},
+			input:       []string{"go", "test", "-exec", "bash -c 'echo hello'"},
+			shouldBlock: true,
+		},
+		// Command name with a leading path must still match.
+		{
+			name:        "block path-qualified command",
+			cmd:         "pacman",
+			args:        nil,
+			flags:       []string{"-S"},
+			input:       []string{"/usr/bin/pacman", "-S", "package"},
+			shouldBlock: true,
+		},
+		// A short flag inside a cluster must still match.
+		{
+			name:        "block clustered short flag",
+			cmd:         "pacman",
+			args:        nil,
+			flags:       []string{"-S"},
+			input:       []string{"pacman", "-Syu", "package"},
+			shouldBlock: true,
+		},
+		// A single-dash long flag must not be split into short flags.
+		{
+			name:        "go test exec is not split",
+			cmd:         "go",
+			args:        []string{"test"},
+			flags:       []string{"-exec"},
+			input:       []string{"go", "test", "-exec", "./mal"},
+			shouldBlock: true,
+		},
+		// Args after "--" are positional, not flags.
+		{
+			name:        "double dash ends flags",
+			cmd:         "pacman",
+			args:        nil,
+			flags:       []string{"-S"},
+			input:       []string{"pacman", "--", "-S"},
+			shouldBlock: false,
+		},
+		{
+			name:        "go test exec",
+			cmd:         "go",
+			args:        []string{"test"},
+			flags:       []string{"-exec"},
+			input:       []string{"go", "test", `-exec="bash -c 'echo hello'"`},
+			shouldBlock: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocker := ArgumentsBlocker(tt.cmd, tt.args, tt.flags)
+			result := blocker(tt.input)
+			require.Equal(t, tt.shouldBlock, result,
+				"Expected block=%v for input %v", tt.shouldBlock, tt.input)
+		})
+	}
+}
+
+func TestCommandsBlocker(t *testing.T) {
+	tests := []struct {
+		name        string
+		banned      []string
+		input       []string
+		shouldBlock bool
+	}{
+		{
+			name:        "block single banned command",
+			banned:      []string{"curl"},
+			input:       []string{"curl", "https://example.com"},
+			shouldBlock: true,
+		},
+		{
+			name:        "allow non-banned command",
+			banned:      []string{"curl", "wget"},
+			input:       []string{"echo", "hello"},
+			shouldBlock: false,
+		},
+		{
+			name:        "block from multiple banned",
+			banned:      []string{"curl", "wget", "nc"},
+			input:       []string{"wget", "https://example.com"},
+			shouldBlock: true,
+		},
+		{
+			name:        "handle empty input",
+			banned:      []string{"curl"},
+			input:       []string{},
+			shouldBlock: false,
+		},
+		{
+			// Windows and macOS both resolve command names case
+			// insensitively, so `CURL` runs the same binary as `curl`.
+			// Matching has to fold case or the list is trivially dodged.
+			name:        "case insensitive matching",
+			banned:      []string{"curl"},
+			input:       []string{"CURL", "https://example.com"},
+			shouldBlock: true,
+		},
+		{
+			name:        "case insensitive matching with mixed case",
+			banned:      []string{"sudo"},
+			input:       []string{"SuDo", "rm", "-rf", "/"},
+			shouldBlock: true,
+		},
+		{
+			name:        "case insensitive matching through a path",
+			banned:      []string{"sudo"},
+			input:       []string{"/usr/bin/SUDO", "rm"},
+			shouldBlock: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocker := CommandsBlocker(tt.banned)
+			result := blocker(tt.input)
+			require.Equal(t, tt.shouldBlock, result,
+				"Expected block=%v for input %v", tt.shouldBlock, tt.input)
+		})
+	}
+}
+
+func TestSplitArgsFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     []string
+		wantArgs  []string
+		wantFlags []string
+	}{
+		{
+			name:      "only args",
+			input:     []string{"install", "package", "another"},
+			wantArgs:  []string{"install", "package", "another"},
+			wantFlags: []string{},
+		},
+		{
+			name:      "only flags",
+			input:     []string{"-g", "--verbose", "-f"},
+			wantArgs:  []string{},
+			wantFlags: []string{"-g", "--verbose", "-f"},
+		},
+		{
+			name:      "mixed args and flags",
+			input:     []string{"install", "-g", "package", "--verbose"},
+			wantArgs:  []string{"install", "package"},
+			wantFlags: []string{"-g", "--verbose"},
+		},
+		{
+			name:      "empty input",
+			input:     []string{},
+			wantArgs:  []string{},
+			wantFlags: []string{},
+		},
+		{
+			name:      "single dash flag",
+			input:     []string{"-S", "package"},
+			wantArgs:  []string{"package"},
+			wantFlags: []string{"-S"},
+		},
+		{
+			name:      "flag with equals sign",
+			input:     []string{"-exec=bash", "package"},
+			wantArgs:  []string{"package"},
+			wantFlags: []string{"-exec", "-e", "-x", "-e", "-c"},
+		},
+		{
+			name:      "long flag with equals sign",
+			input:     []string{"--config=/path/to/config", "run"},
+			wantArgs:  []string{"run"},
+			wantFlags: []string{"--config"},
+		},
+		{
+			name:      "flag with complex value",
+			input:     []string{`-exec="bash -c 'echo hello'"`, "test"},
+			wantArgs:  []string{"test"},
+			wantFlags: []string{"-exec", "-e", "-x", "-e", "-c"},
+		},
+		{
+			name:      "clustered short flags expand",
+			input:     []string{"-Syu", "package"},
+			wantArgs:  []string{"package"},
+			wantFlags: []string{"-Syu", "-S", "-y", "-u"},
+		},
+		{
+			name:      "double dash ends flag parsing",
+			input:     []string{"-g", "--", "-f", "file"},
+			wantArgs:  []string{"-f", "file"},
+			wantFlags: []string{"-g"},
+		},
+		{
+			name:      "bare dash is a positional arg",
+			input:     []string{"-"},
+			wantArgs:  []string{"-"},
+			wantFlags: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args, flags := splitArgsFlags(tt.input)
+			require.Equal(t, tt.wantArgs, args, "args mismatch")
+			require.Equal(t, tt.wantFlags, flags, "flags mismatch")
+		})
+	}
+}
+
+func TestIsCommandBlocked(t *testing.T) {
+	t.Parallel()
+
+	blockedCurl := CommandsBlocker([]string{"curl"})
+
+	tests := []struct {
+		name     string
+		command  string
+		funcs    []BlockFunc
+		expected bool
+	}{
+		{
+			name:     "plain blocked command",
+			command:  "curl https://example.com",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "plain allowed command",
+			command:  "ls -la",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: false,
+		},
+		{
+			// A command the shell cannot parse never reaches execution:
+			// Run refuses it with a parse error of its own. There is no
+			// danger to report, only a typo.
+			name:     "unparseable input is not reported as dangerous",
+			command:  "echo 'unterminated",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: false,
+		},
+		{
+			name:     "command substitution is dangerous",
+			command:  "echo $(curl https://example.com)",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			// Regression: expand.Config.ProcSubst is called by mvdan.cc/sh
+			// without a nil guard, so process substitution used to panic
+			// here instead of failing closed. Crash of 2026-07-30.
+			name:     "process substitution is dangerous, not a panic",
+			command:  `diff -r /tmp/a /tmp/b <(true) 2>/dev/null`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			// Output process substitution hangs off a Redirect node rather
+			// than a CallExpr argument; the walker expands redirect words
+			// too, so it fails closed like the argument form.
+			name:     "output process substitution is dangerous",
+			command:  `echo hi > >(cat)`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "input process substitution via redirect is dangerous",
+			command:  `cat < <(echo hello)`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "blocked command hidden in redirect proc subst is caught",
+			command:  `echo data > >(curl https://example.com)`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "plain redirect is fine",
+			command:  `echo hi > /tmp/out.txt`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: false,
+		},
+		{
+			name:     "redirect with variable filename is fine",
+			command:  `echo hi > "$OUT"`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: false,
+		},
+		{
+			// The exact shape of the command that crashed in production:
+			// proc subst combined with a command substitution and a loop.
+			name: "full crash repro command",
+			command: `cd /somewhere && echo "=== verify ===" && diff -r /tmp/a/docs /tmp/a/internal <(true) 2>/dev/null; for f in $(cd /tmp/a && find . -type f | sed 's|^\./||'); do
+  if ! diff -q "/tmp/a/$f" "$f" >/dev/null 2>&1; then echo "DIFFERS: $f"; fi
+done; echo "=== done ==="`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "command name from a variable is dangerous",
+			command:  "CMD=curl; $CMD https://example.com",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "command name from a substitution is dangerous",
+			command:  "$(which curl) https://example.com",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+		{
+			name:     "variables in arguments are still fine",
+			command:  "echo $HOME/$USER",
+			funcs:    []BlockFunc{blockedCurl},
+			expected: false,
+		},
+		{
+			name:     "windows executable extension is matched case-insensitively",
+			command:  `CURL.EXE https://example.com`,
+			funcs:    []BlockFunc{blockedCurl},
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.expected, IsCommandBlocked(tc.command, tc.funcs))
+		})
+	}
+}
+
+func TestBlockedCommandReason(t *testing.T) {
+	t.Parallel()
+
+	funcs := []BlockFunc{CommandsBlocker([]string{"curl"})}
+
+	tests := []struct {
+		command string
+		reason  string
+	}{
+		{"ls -la", ""},
+		{"curl https://example.com", "curl"},
+		{"/usr/bin/curl https://example.com", "curl"},
+		{"$CMD https://example.com", "expansion in command name"},
+		{"echo $(curl https://example.com)", "substitution in arguments"},
+		// A command the shell cannot parse never runs, so there is
+		// nothing to warn about: it fails with a parse error instead.
+		{"echo 'unterminated", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.command, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.reason, BlockedCommandReason(tc.command, funcs))
 		})
 	}
 }

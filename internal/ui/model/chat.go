@@ -1,0 +1,1345 @@
+package model
+
+import (
+	"image"
+	"slices"
+	"strings"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/ui/chat"
+	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/list"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/clipperhouse/displaywidth"
+	"github.com/clipperhouse/uax29/v2/words"
+)
+
+// Constants for multi-click detection.
+const (
+	doubleClickThreshold = 400 * time.Millisecond // 0.4s is typical double-click threshold
+	clickTolerance       = 2                      // x,y tolerance for double/tripple click
+)
+
+// DelayedClickMsg is sent after the double-click threshold to trigger a
+// single-click action (like expansion) if no double-click occurred.
+type DelayedClickMsg struct {
+	ClickID int
+	ItemIdx int
+	X, Y    int
+}
+
+// scrollbarHideMsg is sent to hide the scrollbar after the timeout period.
+type scrollbarHideMsg struct {
+	seq int // sequence number to ignore stale messages
+}
+
+// sidebarScrollbarHideMsg is sent to hide the sidebar scrollbar after timeout.
+type sidebarScrollbarHideMsg struct {
+	seq int
+}
+
+// scrollbarHideCmd returns a command that sends a scrollbarHideMsg after the timeout.
+func scrollbarHideCmd(seq int) tea.Cmd {
+	return tea.Tick(scrollbarHideDuration, func(_ time.Time) tea.Msg {
+		return scrollbarHideMsg{seq: seq}
+	})
+}
+
+// resizeSettleDuration is how long after the last resize event the chat
+// waits before it starts warming the message cache it skipped mid-drag.
+const resizeSettleDuration = 120 * time.Millisecond
+
+// warmBatchSize is how many messages the chat renders into the width cache
+// per warming step. Kept small so no single step blocks the UI thread for
+// more than a frame or so, even on slow-to-render items.
+const warmBatchSize = 25
+
+// chatWarmMsg drives one incremental cache-warming step. The first one is
+// delayed until the resize settles; the rest fire immediately, one per
+// batch, so warming spreads across frames instead of blocking.
+type chatWarmMsg struct {
+	seq int // guards against stale timers from superseded resizes
+}
+
+// chatWarmCmd schedules the next warming step after delay (zero fires as
+// soon as the runtime delivers it).
+func chatWarmCmd(seq int, delay time.Duration) tea.Cmd {
+	if delay <= 0 {
+		return func() tea.Msg { return chatWarmMsg{seq: seq} }
+	}
+	return tea.Tick(delay, func(_ time.Time) tea.Msg {
+		return chatWarmMsg{seq: seq}
+	})
+}
+
+// sidebarScrollbarHideCmd returns a command that sends a sidebarScrollbarHideMsg
+// after the timeout.
+func sidebarScrollbarHideCmd(seq int) tea.Cmd {
+	return tea.Tick(scrollbarHideDuration, func(_ time.Time) tea.Msg {
+		return sidebarScrollbarHideMsg{seq: seq}
+	})
+}
+
+// Chat represents the chat UI model that handles chat interactions and
+// messages.
+type Chat struct {
+	com      *common.Common
+	list     *list.List
+	idInxMap map[string]int // Map of message IDs to their indices in the list
+
+	// Mouse state
+	mouseDown     bool
+	mouseDownItem int // Item index where mouse was pressed
+	mouseDownX    int // X position in item content (character offset)
+	mouseDownY    int // Y position in item (line offset)
+	mouseDragItem int // Current item index being dragged over
+	mouseDragX    int // Current X in item content
+	mouseDragY    int // Current Y in item
+
+	// Click tracking for double/triple clicks
+	lastClickTime time.Time
+	lastClickX    int
+	lastClickY    int
+	clickCount    int
+
+	// Pending single click action (delayed to detect double-click)
+	pendingClickID int // Incremented on each click to invalidate old pending clicks
+
+	// follow is a flag to indicate whether the view should auto-scroll to
+	// bottom on new messages.
+	follow bool
+
+	// drawCache memoizes the decoded form of the last list.Render output so
+	// repeat frames with byte-identical content skip the per-cell ANSI
+	// reparse that uv.StyledString.Draw performs every call. See F9
+	// (docs/notes/2026-05-12-chat-rendering-perf.md §4.8). Bounded to one
+	// entry; invalidated implicitly by string inequality on the next Draw.
+	drawCache *chatDrawCache
+
+	// Scrollbar visibility state
+	scrollbarVisible bool
+	scrollbarHideSeq int    // current sequence number for hide timer
+	scrollbarMode    string // "default", "always", or "never"
+	// scrollbarHideArmed is the hide timeout already scheduled, or zero when
+	// none is outstanding. The tick is armed from the UI's Update tail rather
+	// than returned by the scroll calls, so a caller ignoring a command can
+	// no longer lose the auto-hide.
+	scrollbarHideArmed int
+
+	// resizing suppresses the O(N) total-height scan while a resize is in
+	// flight (and during the incremental warm afterward), so a drag only
+	// reflows the visible items. resizeSettleSeq guards stale settle/warm
+	// timers; warmNext tracks warming progress through the message list.
+	resizing        bool
+	resizeSettleSeq int
+	warmNext        int
+}
+
+// scrollbarHideDuration is how long the scrollbar remains visible after scroll activity.
+const scrollbarHideDuration = 2 * time.Second
+
+// chatDrawCache holds the pre-decoded form of the last list.Render output.
+// The cache is keyed by the rendered string and the screen's width method
+// (graphemes vs wcwidth pick different decoders inside ultraviolet's
+// printString, so a cached buffer is only valid for the method it was
+// decoded with). The cached buffer is independent of the draw area, so
+// resize / scroll changes that produce the same string still hit. We cannot
+// use uv.StyledString.Lines because it bottoms out at the first iteration
+// against a zero-bounds rectangle (see ultraviolet styled.go line 45 — the
+// shared printString loop's `y >= bounds.Max.Y` exit applies to the
+// line-building branch too). A Buffer of the rendered text's natural
+// dimensions is the cheapest correct shape: StyledString.Draw runs once on
+// miss to populate it, and Buffer.Draw is an O(cells) cell copy with no
+// ANSI re-parse on hit.
+type chatDrawCache struct {
+	rendered string
+	method   ansi.Method
+	buf      uv.ScreenBuffer
+}
+
+// NewChat creates a new instance of [Chat] that handles chat interactions and
+// messages.
+func NewChat(com *common.Common, scrollbarMode string) *Chat {
+	c := &Chat{
+		com:           com,
+		idInxMap:      make(map[string]int),
+		scrollbarMode: scrollbarMode,
+	}
+	l := list.NewList()
+	l.SetGap(1)
+	l.RegisterRenderCallback(c.applyHighlightRange)
+	l.RegisterRenderCallback(list.FocusedRenderCallback(l))
+	c.list = l
+	c.mouseDownItem = -1
+	c.mouseDragItem = -1
+	return c
+}
+
+// Height returns the height of the chat view port.
+func (m *Chat) Height() int {
+	return m.list.Height()
+}
+
+// Draw renders the chat UI component to the screen and the given area.
+//
+// The list's rendered output is cached in decoded form (see chatDrawCache) so
+// that frames with byte-identical content skip the ANSI reparse that
+// uv.StyledString.Draw performs on every call. The cache is keyed by the
+// rendered string and the screen's width method; area / scroll changes do not
+// invalidate it.
+func (m *Chat) Draw(scr uv.Screen, area uv.Rectangle) {
+	// Determine scrollbar visibility. Skip it entirely while resizing: the
+	// thumb needs the exact total height (O(N) after a width change), which
+	// is the dominant resize cost. It returns once the resize settles and
+	// the cache has been warmed. The needs-scrollbar test itself uses the
+	// cheap bounded overflow check.
+	listHeight := m.list.Height() - 1
+	needsScrollbar := false
+	if !m.resizing {
+		needsScrollbar = m.list.Overflows(m.list.Height())
+	}
+
+	// Determine visibility based on scrollbar mode.
+	showScrollbar := false
+	switch m.scrollbarMode {
+	case config.ScrollbarAlways:
+		showScrollbar = needsScrollbar
+	case config.ScrollbarDefault:
+		showScrollbar = needsScrollbar && m.scrollbarVisible
+	case config.ScrollbarNever:
+		showScrollbar = false
+	}
+
+	rendered := m.list.Render()
+	// In follow mode the view stays pinned to the end. Re-anchor whenever
+	// the render moved the end: content growing past it (streaming), or
+	// shrinking away from it (an item removed, such as the prompt echo
+	// giving way to the stored prompt), which would otherwise leave the
+	// transcript lifted off the bottom until something else scrolls.
+	if m.follow {
+		idx, line := m.list.ScrollPosition()
+		m.list.ScrollToBottom()
+		if newIdx, newLine := m.list.ScrollPosition(); newIdx != idx || newLine != line {
+			rendered = m.list.Render()
+		}
+	}
+	method, ok := scr.WidthMethod().(ansi.Method)
+	if !ok {
+		// Width method isn't an ansi.Method (unlikely in practice — both
+		// TerminalScreen and ScreenBuffer store ansi.Method). Fall back
+		// to the uncached path so behavior matches upstream exactly.
+		uv.NewStyledString(rendered).Draw(scr, area)
+	} else {
+		if m.drawCache == nil ||
+			m.drawCache.rendered != rendered ||
+			m.drawCache.method != method {
+			m.drawCache = newChatDrawCache(rendered, method)
+		}
+		drawCachedBuffer(scr, area, m.drawCache.buf)
+	}
+
+	// Never drawn while resizing.
+	if showScrollbar {
+		scrollbar := common.Scrollbar(m.com.Styles, listHeight, m.list.TotalHeight()-1, listHeight, m.list.Offset())
+		if scrollbar != "" {
+			scrollbarArea := image.Rectangle{
+				Min: image.Point{X: area.Max.X - m.scrollbarCols(), Y: area.Min.Y},
+				Max: image.Point{X: area.Max.X, Y: area.Max.Y},
+			}
+			uv.NewStyledString(scrollbar).Draw(scr, scrollbarArea)
+		}
+	}
+}
+
+// newChatDrawCache builds a chatDrawCache for the given rendered string by
+// running uv.StyledString.Draw into a fresh buffer sized to the text's
+// natural bounds under the active width method. This is the only place
+// ANSI decoding happens for cached frames — subsequent draws reuse buf
+// via drawCachedBuffer.
+//
+// We can't use uv.StyledString.Bounds() here: it is hard-coded to
+// ansi.GraphemeWidth, while StyledString.Draw lays cells using the
+// destination buffer's WidthMethod (which we capture in `method`). For
+// strings where graphemes and wcwidth disagree (emoji ZWJ sequences,
+// some CJK, certain combining marks) the two answers diverge, leaving
+// the cached buffer either too small (trailing cells dropped on hit) or
+// too large (dead cells past the live content). Computing dimensions
+// with `method.StringWidth` per line matches what printString tallies
+// cell-by-cell, since both decode ANSI sequences and use the same width
+// method.
+func newChatDrawCache(rendered string, method ansi.Method) *chatDrawCache {
+	w, h := renderedBounds(rendered, method)
+	if w <= 0 {
+		w = 1
+	}
+	if h <= 0 {
+		h = 1
+	}
+	buf := uv.NewScreenBuffer(w, h)
+	buf.Method = method
+	uv.NewStyledString(rendered).Draw(buf, buf.Bounds())
+	return &chatDrawCache{
+		rendered: rendered,
+		method:   method,
+		buf:      buf,
+	}
+}
+
+// renderedBounds returns the (width, height) cell extent of rendered
+// when laid out by method. Width is the widest line's StringWidth (which
+// strips ANSI sequences and tallies cells via method, exactly like
+// printString); height is the line count. Both match what
+// uv.StyledString.Draw will write into a buffer whose WidthMethod is
+// method, so the cache buffer is always sized to fit the live content.
+func renderedBounds(rendered string, method ansi.Method) (w, h int) {
+	for line := range strings.SplitSeq(rendered, "\n") {
+		w = max(w, method.StringWidth(line))
+		h++
+	}
+	return w, h
+}
+
+// drawCachedBuffer blits a previously-decoded buffer into scr at area,
+// mirroring uv.StyledString.Draw's screen-mode behavior for the default
+// Wrap=false, Tail="" case. The clear loop matches StyledString.Draw line
+// 51-56; the buf.Draw call replaces the per-cell ANSI decode that
+// printString does on every uncached frame with a pure cell copy.
+func drawCachedBuffer(scr uv.Screen, area uv.Rectangle, buf uv.ScreenBuffer) {
+	// Clear the area first to match StyledString.Draw — leftover cells
+	// from a previous frame outside the new content must be zeroed,
+	// because Buffer.Draw skips empty cells (it doesn't clear).
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		for x := area.Min.X; x < area.Max.X; x++ {
+			scr.SetCell(x, y, nil)
+		}
+	}
+	buf.Draw(scr, area)
+}
+
+// BeginResize marks the chat as actively resizing so the next draws skip
+// the full-height scan (and the scrollbar), reflowing only the visible
+// items. It returns a command that, once resizing settles, starts warming
+// the cache so the scrollbar can recompute without blocking.
+func (m *Chat) BeginResize() tea.Cmd {
+	m.resizing = true
+	m.resizeSettleSeq++
+	m.warmNext = 0
+	return chatWarmCmd(m.resizeSettleSeq, resizeSettleDuration)
+}
+
+// WarmStep renders the next batch of messages into the width cache and
+// returns a command to continue warming plus whether warming finished. On
+// completion the resize suppression is cleared so the next draw recomputes
+// the (now instant) total height and scrollbar. A stale seq — from a resize
+// that has since been superseded — is a no-op returning (nil, false).
+func (m *Chat) WarmStep(seq int) (cmd tea.Cmd, done bool) {
+	if seq != m.resizeSettleSeq {
+		return nil, false
+	}
+	m.warmNext = m.list.Prewarm(m.warmNext, warmBatchSize)
+	if m.warmNext >= m.list.Len() {
+		m.resizing = false
+		return nil, true
+	}
+	return chatWarmCmd(seq, 0), false
+}
+
+// SetSize sets the size of the chat view port.
+func (m *Chat) SetSize(width, height int) {
+	// Capture whether we should stay pinned to the bottom *before* the size
+	// change. A width change rewraps every item, so the list's line offsets
+	// (offsetIdx/offsetLine) become stale and AtBottom() can no longer be
+	// trusted afterward. follow short-circuits the AtBottom() walk in the
+	// common streaming case.
+	wasFollowing := m.follow || m.AtBottom()
+	m.list.SetSize(max(0, width-m.scrollbarCols()), height)
+	// Re-anchor to bottom if we were pinned there before the resize.
+	if wasFollowing {
+		m.ScrollToBottom()
+	}
+}
+
+// scrollbarCols is the width reserved for the scrollbar. It does not depend
+// on overflow, so the list width (and every cached render) never flips as
+// the transcript crosses the viewport height.
+func (m *Chat) scrollbarCols() int {
+	if m.scrollbarMode == config.ScrollbarNever {
+		return 0
+	}
+	return 1
+}
+
+// Len returns the number of items in the chat list.
+func (m *Chat) Len() int {
+	return m.list.Len()
+}
+
+// Restyle drops cached rendered output on every message item so it
+// re-renders with the current styles once drawn. Styles never change
+// layout, so the list keeps its heights and only visible items render on
+// the next frame.
+func (m *Chat) Restyle() {
+	m.list.Restyle(func(item list.Item) {
+		if msg, ok := item.(chat.MessageItem); ok {
+			chat.ClearItemCache(msg)
+		}
+	})
+}
+
+// SetMessages sets the chat messages to the provided list of message items.
+func (m *Chat) SetMessages(msgs ...chat.MessageItem) tea.Cmd {
+	m.idInxMap = make(map[string]int)
+	m.resetScrollbar() // Reset scrollbar visibility on new session load
+
+	items := make([]list.Item, len(msgs))
+	for i, msg := range msgs {
+		m.idInxMap[msg.ID()] = i
+		// Register nested tool IDs for tools that contain nested tools.
+		if container, ok := msg.(chat.NestedToolContainer); ok {
+			for _, nested := range container.NestedTools() {
+				m.idInxMap[nested.ID()] = i
+			}
+		}
+		items[i] = msg
+	}
+	m.list.SetItems(items...)
+	m.ScrollToBottom()
+	return nil
+}
+
+// AppendMessages appends a new message item to the chat list.
+//
+// The turn placeholder is carried to the end, so a message that lands while
+// it is up goes above it rather than below: the spinner marks the bottom of
+// the transcript for the whole turn instead of hopping over each arrival.
+func (m *Chat) AppendMessages(msgs ...chat.MessageItem) {
+	if pending := m.MessageItem(chat.PendingAssistantID); pending != nil && !containsMessage(msgs, chat.PendingAssistantID) {
+		m.RemoveMessage(chat.PendingAssistantID)
+		msgs = append(append(make([]chat.MessageItem, 0, len(msgs)+1), msgs...), pending)
+	}
+
+	items := make([]list.Item, len(msgs))
+	indexOffset := m.list.Len()
+	for i, msg := range msgs {
+		m.idInxMap[msg.ID()] = indexOffset + i
+		// Register nested tool IDs for tools that contain nested tools.
+		if container, ok := msg.(chat.NestedToolContainer); ok {
+			for _, nested := range container.NestedTools() {
+				m.idInxMap[nested.ID()] = indexOffset + i
+			}
+		}
+		items[i] = msg
+	}
+	m.list.AppendItems(items...)
+}
+
+// LastPromptID returns the id of the last stored prompt in view, or "".
+func (m *Chat) LastPromptID() string {
+	for i := m.list.Len() - 1; i >= 0; i-- {
+		item, ok := m.list.ItemAt(i).(*chat.UserMessageItem)
+		if ok && item.ID() != chat.PendingUserID && item.Message().IsPrompt() {
+			return item.ID()
+		}
+	}
+	return ""
+}
+
+// containsMessage reports whether any of msgs carries the given id.
+func containsMessage(msgs []chat.MessageItem, id string) bool {
+	return slices.ContainsFunc(msgs, func(msg chat.MessageItem) bool {
+		return msg.ID() == id
+	})
+}
+
+// UpdateNestedToolIDs updates the ID map for nested tools within a container.
+// Call this after modifying nested tools to ensure animations work correctly.
+func (m *Chat) UpdateNestedToolIDs(containerID string) {
+	idx, ok := m.idInxMap[containerID]
+	if !ok {
+		return
+	}
+
+	item, ok := m.list.ItemAt(idx).(chat.MessageItem)
+	if !ok {
+		return
+	}
+
+	container, ok := item.(chat.NestedToolContainer)
+	if !ok {
+		return
+	}
+
+	// Register all nested tool IDs to point to the container's index.
+	for _, nested := range container.NestedTools() {
+		m.idInxMap[nested.ID()] = idx
+	}
+}
+
+// hasVisibleAnimation reports whether any item in the viewport is spinning.
+func (m *Chat) hasVisibleAnimation() bool {
+	if m.list.Len() == 0 {
+		return false
+	}
+	startIdx, endIdx := m.list.VisibleItemIndices()
+	for idx := startIdx; idx <= endIdx; idx++ {
+		if animatable, ok := m.list.ItemAt(idx).(chat.Animatable); ok && animatable.Spinning() {
+			return true
+		}
+	}
+	return false
+}
+
+// advanceVisible steps every visible spinning item by one frame and reports
+// whether any rendered output changed.
+func (m *Chat) advanceVisible() (changed bool) {
+	if m.list.Len() == 0 {
+		return false
+	}
+	startIdx, endIdx := m.list.VisibleItemIndices()
+	for idx := startIdx; idx <= endIdx; idx++ {
+		if animatable, ok := m.list.ItemAt(idx).(chat.Animatable); ok && animatable.Spinning() && animatable.Advance() {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// Focus sets the focus state of the chat component.
+func (m *Chat) Focus() {
+	m.list.Focus()
+}
+
+// Blur removes the focus state from the chat component.
+func (m *Chat) Blur() {
+	m.list.Blur()
+}
+
+// ScrollPosition returns the list's first visible item index and the line
+// offset into it.
+func (m *Chat) ScrollPosition() (offsetIdx, offsetLine int) {
+	return m.list.ScrollPosition()
+}
+
+// Offset returns the scroll offset in lines from the top of the list.
+func (m *Chat) Offset() int {
+	return m.list.Offset()
+}
+
+// Selected returns the index of the selected item.
+func (m *Chat) Selected() int {
+	return m.list.Selected()
+}
+
+// Focused returns whether the chat list is focused.
+func (m *Chat) Focused() bool {
+	return m.list.Focused()
+}
+
+// RenderState captures everything about the chat that affects its rendered
+// output and is not carried by item versions. Anything added to Chat that
+// Draw reads belongs here, so callers that memoize whole frames stay correct
+// without knowing Chat's internals.
+type RenderState struct {
+	OffsetIdx        int
+	OffsetLine       int
+	Selected         int
+	Focused          bool
+	ScrollbarVisible bool
+	// ItemsVersion changes when any message mutates its rendered output.
+	ItemsVersion uint64
+}
+
+// RenderState returns the current render-affecting chat state. It renders
+// nothing; the only non-constant part is the item version fold, which reads
+// one field per message.
+func (m *Chat) RenderState() RenderState {
+	offsetIdx, offsetLine := m.ScrollPosition()
+	return RenderState{
+		OffsetIdx:        offsetIdx,
+		OffsetLine:       offsetLine,
+		Selected:         m.Selected(),
+		Focused:          m.Focused(),
+		ScrollbarVisible: m.scrollbarVisible,
+		ItemsVersion:     m.list.ItemsVersion(),
+	}
+}
+
+// AtBottom returns whether the chat list is currently scrolled to the bottom.
+func (m *Chat) AtBottom() bool {
+	return m.list.AtBottom()
+}
+
+// Follow returns whether the chat view is in follow mode (auto-scroll to
+// bottom on new messages).
+func (m *Chat) Follow() bool {
+	return m.follow
+}
+
+// ScrollToBottom scrolls the chat view to the bottom.
+// Does not trigger scrollbar visibility (auto-scroll to show new content).
+func (m *Chat) ScrollToBottom() {
+	m.list.ScrollToBottom()
+	m.follow = true
+}
+
+// ScrollToTop scrolls the chat view to the top.
+func (m *Chat) ScrollToTop() {
+	m.list.ScrollToTop()
+	m.follow = false // Disable follow mode when user scrolls up
+	m.showScrollbar()
+}
+
+// ScrollBy scrolls the chat view by the given number of line deltas.
+func (m *Chat) ScrollBy(lines int) {
+	m.list.ScrollBy(lines)
+	if lines < 0 {
+		// Scrolling up always disables follow mode.
+		m.follow = false
+	} else if m.AtBottom() {
+		// Scrolling down re-enables follow when we reach the bottom.
+		m.follow = true
+	}
+	m.showScrollbar()
+}
+
+// ScrollToSelected scrolls the chat view to the selected item.
+func (m *Chat) ScrollToSelected() {
+	m.list.ScrollToSelected()
+	m.follow = m.AtBottom() // Disable follow mode if user scrolls up
+	m.showScrollbar()
+}
+
+// ScrollToIndex scrolls the chat view to the item at the given index.
+func (m *Chat) ScrollToIndex(index int) {
+	m.list.ScrollToIndex(index)
+	m.follow = m.AtBottom() // Disable follow mode if user scrolls up
+	m.showScrollbar()
+}
+
+// showScrollbar reveals the scrollbar and restarts its auto-hide timeout.
+// The tick itself is scheduled by EnsureScrollbarHide.
+func (m *Chat) showScrollbar() {
+	// Only start timer for "default" mode
+	if m.scrollbarMode != config.ScrollbarDefault {
+		return
+	}
+	m.scrollbarVisible = true
+	m.scrollbarHideSeq++
+}
+
+// EnsureScrollbarHide schedules the hide tick for a visible scrollbar whose
+// current timeout has none outstanding. Each scroll bumps the sequence, so a
+// fresh deadline is armed for the newest activity while earlier ticks go stale
+// and get ignored. This is the sole place the timeout is armed, mirroring the
+// shared animation clock, so no call site can drop it.
+func (m *Chat) EnsureScrollbarHide() tea.Cmd {
+	if m.scrollbarMode != config.ScrollbarDefault || !m.scrollbarVisible {
+		return nil
+	}
+	if m.scrollbarHideArmed == m.scrollbarHideSeq {
+		return nil
+	}
+	m.scrollbarHideArmed = m.scrollbarHideSeq
+	return scrollbarHideCmd(m.scrollbarHideSeq)
+}
+
+// HideScrollbar hides the scrollbar if the sequence matches.
+func (m *Chat) HideScrollbar(seq int) {
+	// Only hide scrollbar for "default" mode
+	if m.scrollbarMode != config.ScrollbarDefault {
+		return
+	}
+	if seq == m.scrollbarHideSeq {
+		m.scrollbarVisible = false
+		m.scrollbarHideArmed = 0
+	}
+}
+
+// resetScrollbar hides the scrollbar and forgets any outstanding timeout, for
+// when the list stops showing the content it was scrolled through.
+func (m *Chat) resetScrollbar() {
+	m.scrollbarVisible = false
+	m.scrollbarHideArmed = 0
+}
+
+// ScrollToBottomAndSelectLast scrolls the chat view to the bottom and selects
+// the last item.
+func (m *Chat) ScrollToBottomAndSelectLast() {
+	m.ScrollToBottom()
+	m.SelectLast()
+}
+
+// SelectedItemInView returns whether the selected item is currently in view.
+func (m *Chat) SelectedItemInView() bool {
+	return m.list.SelectedItemInView()
+}
+
+func (m *Chat) isSelectable(index int) bool {
+	item := m.list.ItemAt(index)
+	if item == nil {
+		return false
+	}
+	_, ok := item.(list.Focusable)
+	return ok
+}
+
+// SetSelected sets the selected message index in the chat list.
+func (m *Chat) SetSelected(index int) {
+	m.list.SetSelected(index)
+	if index < 0 || index >= m.list.Len() {
+		return
+	}
+	for {
+		if m.isSelectable(m.list.Selected()) {
+			return
+		}
+		if m.list.SelectNext() {
+			continue
+		}
+		// If we're at the end and the last item isn't selectable, walk backwards
+		// to find the nearest selectable item.
+		for {
+			if !m.list.SelectPrev() {
+				return
+			}
+			if m.isSelectable(m.list.Selected()) {
+				return
+			}
+		}
+	}
+}
+
+// SelectPrev selects the previous message in the chat list.
+func (m *Chat) SelectPrev() {
+	for {
+		if !m.list.SelectPrev() {
+			return
+		}
+		if m.isSelectable(m.list.Selected()) {
+			return
+		}
+	}
+}
+
+// SelectNext selects the next message in the chat list.
+func (m *Chat) SelectNext() {
+	for {
+		if !m.list.SelectNext() {
+			return
+		}
+		if m.isSelectable(m.list.Selected()) {
+			return
+		}
+	}
+}
+
+// SelectFirst selects the first message in the chat list.
+func (m *Chat) SelectFirst() {
+	if !m.list.SelectFirst() {
+		return
+	}
+	if m.isSelectable(m.list.Selected()) {
+		return
+	}
+	for {
+		if !m.list.SelectNext() {
+			return
+		}
+		if m.isSelectable(m.list.Selected()) {
+			return
+		}
+	}
+}
+
+// SelectLast selects the last message in the chat list.
+func (m *Chat) SelectLast() {
+	if !m.list.SelectLast() {
+		return
+	}
+	if m.isSelectable(m.list.Selected()) {
+		return
+	}
+	for {
+		if !m.list.SelectPrev() {
+			return
+		}
+		if m.isSelectable(m.list.Selected()) {
+			return
+		}
+	}
+}
+
+// SelectFirstInView selects the first message currently in view.
+func (m *Chat) SelectFirstInView() {
+	startIdx, endIdx := m.list.VisibleItemIndices()
+	for i := startIdx; i <= endIdx; i++ {
+		if m.isSelectable(i) {
+			m.list.SetSelected(i)
+			return
+		}
+	}
+}
+
+// SelectLastInView selects the last message currently in view.
+func (m *Chat) SelectLastInView() {
+	startIdx, endIdx := m.list.VisibleItemIndices()
+	for i := endIdx; i >= startIdx; i-- {
+		if m.isSelectable(i) {
+			m.list.SetSelected(i)
+			return
+		}
+	}
+}
+
+// SelectNearestInView moves an out-of-view selection to the visible edge
+// nearest to it: the top row when the selection is above the viewport, the
+// bottom row when it is below. With no selection, scrolledUp picks the
+// bottom row (the content the user is moving towards) and otherwise the
+// top row.
+func (m *Chat) SelectNearestInView(scrolledUp bool) {
+	startIdx, _ := m.list.VisibleItemIndices()
+	sel := m.list.Selected()
+	switch {
+	case sel < 0:
+		if scrolledUp {
+			m.SelectLastInView()
+		} else {
+			m.SelectFirstInView()
+		}
+	case sel < startIdx:
+		m.SelectFirstInView()
+	default:
+		m.SelectLastInView()
+	}
+}
+
+// ClearMessages removes all messages from the chat list.
+func (m *Chat) ClearMessages() {
+	m.idInxMap = make(map[string]int)
+	m.resetScrollbar()
+	m.list.SetItems()
+	m.ClearMouse()
+}
+
+// RemoveMessage removes a message from the chat list by its ID.
+func (m *Chat) RemoveMessage(id string) {
+	idx, ok := m.idInxMap[id]
+	if !ok {
+		return
+	}
+
+	// Remove from list
+	m.list.RemoveItem(idx)
+
+	// Remove from index map
+	delete(m.idInxMap, id)
+
+	// Rebuild index map for all items after the removed one
+	for i := idx; i < m.list.Len(); i++ {
+		if item, ok := m.list.ItemAt(i).(chat.MessageItem); ok {
+			m.idInxMap[item.ID()] = i
+		}
+	}
+}
+
+// RemoveStaleToolCalls removes the tool items of message messageID whose
+// calls are not in keep, as a retried response drops what its failed attempt
+// streamed. Only the live message is retried, so only the tail is scanned.
+func (m *Chat) RemoveStaleToolCalls(messageID string, keep []message.ToolCall) {
+	var stale []string
+	for i := m.list.Len() - 1; i >= 0; i-- {
+		item, ok := m.list.ItemAt(i).(chat.MessageItem)
+		if !ok {
+			break
+		}
+		tool, isTool := item.(chat.ToolMessageItem)
+		switch {
+		case isTool && tool.MessageID() == messageID:
+			id := tool.ToolCall().ID
+			if !slices.ContainsFunc(keep, func(tc message.ToolCall) bool { return tc.ID == id }) {
+				stale = append(stale, id)
+			}
+		case item.ID() == messageID || item.ID() == chat.AssistantInfoID(messageID):
+		default:
+			i = 0
+		}
+	}
+	for _, id := range stale {
+		m.RemoveMessage(id)
+	}
+}
+
+// MessageItem returns the message item with the given ID, or nil if not found.
+func (m *Chat) MessageItem(id string) chat.MessageItem {
+	idx, ok := m.idInxMap[id]
+	if !ok {
+		return nil
+	}
+	item, ok := m.list.ItemAt(idx).(chat.MessageItem)
+	if !ok {
+		return nil
+	}
+	return item
+}
+
+// MessageItemAt returns the message item at index i, or nil if i is out of
+// range or the item is not a [chat.MessageItem].
+func (m *Chat) MessageItemAt(i int) chat.MessageItem {
+	if i < 0 || i >= m.list.Len() {
+		return nil
+	}
+	item, ok := m.list.ItemAt(i).(chat.MessageItem)
+	if !ok {
+		return nil
+	}
+	return item
+}
+
+// ToggleExpandedSelectedItem expands the selected message item if it is expandable.
+func (m *Chat) ToggleExpandedSelectedItem() {
+	if expandable, ok := m.list.SelectedItem().(chat.Expandable); ok {
+		wasFollowing := m.follow
+		expandable.ToggleExpanded()
+		if wasFollowing {
+			m.ScrollToBottom()
+		}
+	}
+}
+
+// IsSelectedShellItem returns true if the currently selected item is a
+// ShellItem (bang-mode result).
+func (m *Chat) IsSelectedShellItem() bool {
+	_, ok := m.list.SelectedItem().(*chat.ShellItem)
+	return ok
+}
+
+// ScrollSelectedShellHorizontal scrolls the selected ShellItem horizontally
+// by delta columns. No-op if the selected item is not a ShellItem.
+func (m *Chat) ScrollSelectedShellHorizontal(delta int) {
+	if shell, ok := m.list.SelectedItem().(*chat.ShellItem); ok {
+		shell.ScrollHorizontal(delta)
+	}
+}
+
+// HandleKeyMsg handles key events for the chat component.
+func (m *Chat) HandleKeyMsg(key tea.KeyMsg) (bool, tea.Cmd) {
+	if m.list.Focused() {
+		if handler, ok := m.list.SelectedItem().(chat.KeyEventHandler); ok {
+			return handler.HandleKeyEvent(key)
+		}
+	}
+	return false, nil
+}
+
+// HandleMouseDown handles mouse down events for the chat component.
+// It detects single, double, and triple clicks for text selection.
+// Returns whether the click was handled and an optional command for delayed
+// single-click actions.
+func (m *Chat) HandleMouseDown(x, y int) (bool, tea.Cmd) {
+	if m.list.Len() == 0 {
+		return false, nil
+	}
+
+	itemIdx, itemY := m.list.ItemIndexAtPosition(x, y)
+	if itemIdx < 0 {
+		return false, nil
+	}
+	if !m.isSelectable(itemIdx) {
+		return false, nil
+	}
+
+	// Increment pending click ID to invalidate any previous pending clicks.
+	m.pendingClickID++
+	clickID := m.pendingClickID
+
+	// Detect multi-click (double/triple)
+	now := time.Now()
+	if now.Sub(m.lastClickTime) <= doubleClickThreshold &&
+		abs(x-m.lastClickX) <= clickTolerance &&
+		abs(y-m.lastClickY) <= clickTolerance {
+		m.clickCount++
+	} else {
+		m.clickCount = 1
+	}
+	m.lastClickTime = now
+	m.lastClickX = x
+	m.lastClickY = y
+
+	// Select the item that was clicked
+	m.list.SetSelected(itemIdx)
+
+	var cmd tea.Cmd
+
+	switch m.clickCount {
+	case 1:
+		// Single click - start selection and schedule delayed click action.
+		m.mouseDown = true
+		m.mouseDownItem = itemIdx
+		m.mouseDownX = x
+		m.mouseDownY = itemY
+		m.mouseDragItem = itemIdx
+		m.mouseDragX = x
+		m.mouseDragY = itemY
+
+		// Schedule delayed click action (e.g., expansion) after a short delay.
+		// If a double-click occurs, the clickID will be invalidated.
+		cmd = tea.Tick(doubleClickThreshold, func(t time.Time) tea.Msg {
+			return DelayedClickMsg{
+				ClickID: clickID,
+				ItemIdx: itemIdx,
+				X:       x,
+				Y:       itemY,
+			}
+		})
+	case 2:
+		// Double click - select word (no delayed action)
+		m.selectWord(itemIdx, x, itemY)
+	case 3:
+		// Triple click - select line (no delayed action)
+		m.selectLine(itemIdx, itemY)
+		m.clickCount = 0 // Reset after triple click
+	}
+
+	return true, cmd
+}
+
+// HandleDelayedClick handles a delayed single-click action (like expansion).
+// It only executes if the click ID matches (i.e., no double-click occurred)
+// and no text selection was made (drag to select).
+func (m *Chat) HandleDelayedClick(msg DelayedClickMsg) bool {
+	// Ignore if this click was superseded by a newer click (double/triple).
+	if msg.ClickID != m.pendingClickID {
+		return false
+	}
+
+	// Don't expand if user dragged to select text.
+	if m.HasHighlight() {
+		return false
+	}
+
+	// Execute the click action (e.g., expansion).
+	selectedItem := m.list.SelectedItem()
+	if clickable, ok := selectedItem.(list.MouseClickable); ok {
+		handled := clickable.HandleMouseClick(ansi.MouseButton1, msg.X, msg.Y)
+		// Toggle expansion only when the item signalled it handled the
+		// click. Items like AssistantMessageItem only report handled when
+		// the click is on their expandable region, so this avoids
+		// toggling expansion for clicks outside the clickable area.
+		if handled {
+			if expandable, ok := selectedItem.(chat.Expandable); ok {
+				wasFollowing := m.follow
+				expandable.ToggleExpanded()
+				if wasFollowing {
+					m.ScrollToBottom()
+				}
+			}
+		}
+		return handled
+	}
+
+	return false
+}
+
+// HandleMouseUp handles mouse up events for the chat component.
+func (m *Chat) HandleMouseUp(x, y int) bool {
+	if !m.mouseDown {
+		return false
+	}
+
+	m.mouseDown = false
+	return true
+}
+
+// HandleMouseDrag handles mouse drag events for the chat component.
+func (m *Chat) HandleMouseDrag(x, y int) bool {
+	if !m.mouseDown {
+		return false
+	}
+
+	if m.list.Len() == 0 {
+		return false
+	}
+
+	itemIdx, itemY := m.list.ItemIndexAtPosition(x, y)
+	if itemIdx < 0 {
+		return false
+	}
+
+	m.mouseDragItem = itemIdx
+	m.mouseDragX = x
+	m.mouseDragY = itemY
+
+	return true
+}
+
+// HasHighlight returns whether there is currently highlighted content.
+func (m *Chat) HasHighlight() bool {
+	startItemIdx, startLine, startCol, endItemIdx, endLine, endCol := m.getHighlightRange()
+	return startItemIdx >= 0 && endItemIdx >= 0 && (startLine != endLine || startCol != endCol)
+}
+
+// HighlightContent returns the currently highlighted content based on the mouse
+// selection. It returns an empty string if no content is highlighted.
+func (m *Chat) HighlightContent() string {
+	startItemIdx, startLine, startCol, endItemIdx, endLine, endCol := m.getHighlightRange()
+	if startItemIdx < 0 || endItemIdx < 0 || startLine == endLine && startCol == endCol {
+		return ""
+	}
+
+	var sb strings.Builder
+	for i := startItemIdx; i <= endItemIdx; i++ {
+		item := m.list.ItemAt(i)
+		if hi, ok := item.(list.Highlightable); ok {
+			startLine, startCol, endLine, endCol := hi.Highlight()
+			listWidth := m.list.Width()
+			var rendered string
+			if rr, ok := item.(list.RawRenderable); ok {
+				rendered = rr.RawRender(listWidth)
+			} else {
+				rendered = item.Render(listWidth)
+			}
+			sb.WriteString(list.HighlightContent(
+				rendered,
+				uv.Rect(0, 0, listWidth, lipgloss.Height(rendered)),
+				startLine,
+				startCol,
+				endLine,
+				endCol,
+			))
+			sb.WriteString(strings.Repeat("\n", m.list.Gap()))
+		}
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+// ClearMouse clears the current mouse interaction state.
+func (m *Chat) ClearMouse() {
+	m.mouseDown = false
+	m.mouseDownItem = -1
+	m.mouseDragItem = -1
+	m.lastClickTime = time.Time{}
+	m.lastClickX = 0
+	m.lastClickY = 0
+	m.clickCount = 0
+	m.pendingClickID++ // Invalidate any pending delayed click
+}
+
+// applyHighlightRange applies the current highlight range to the chat items.
+func (m *Chat) applyHighlightRange(idx, selectedIdx int, item list.Item) list.Item {
+	if hi, ok := item.(list.Highlightable); ok {
+		// Apply highlight
+		startItemIdx, startLine, startCol, endItemIdx, endLine, endCol := m.getHighlightRange()
+		sLine, sCol, eLine, eCol := -1, -1, -1, -1
+		if idx >= startItemIdx && idx <= endItemIdx {
+			if idx == startItemIdx && idx == endItemIdx {
+				// Single item selection
+				sLine = startLine
+				sCol = startCol
+				eLine = endLine
+				eCol = endCol
+			} else if idx == startItemIdx {
+				// First item - from start position to end of item
+				sLine = startLine
+				sCol = startCol
+				eLine = -1
+				eCol = -1
+			} else if idx == endItemIdx {
+				// Last item - from start of item to end position
+				sLine = 0
+				sCol = 0
+				eLine = endLine
+				eCol = endCol
+			} else {
+				// Middle item - fully highlighted
+				sLine = 0
+				sCol = 0
+				eLine = -1
+				eCol = -1
+			}
+		}
+
+		hi.SetHighlight(sLine, sCol, eLine, eCol)
+		return hi.(list.Item)
+	}
+
+	return item
+}
+
+// getHighlightRange returns the current highlight range.
+func (m *Chat) getHighlightRange() (startItemIdx, startLine, startCol, endItemIdx, endLine, endCol int) {
+	if m.mouseDownItem < 0 {
+		return -1, -1, -1, -1, -1, -1
+	}
+
+	downItemIdx := m.mouseDownItem
+	dragItemIdx := m.mouseDragItem
+
+	// Determine selection direction
+	draggingDown := dragItemIdx > downItemIdx ||
+		(dragItemIdx == downItemIdx && m.mouseDragY > m.mouseDownY) ||
+		(dragItemIdx == downItemIdx && m.mouseDragY == m.mouseDownY && m.mouseDragX >= m.mouseDownX)
+
+	if draggingDown {
+		// Normal forward selection
+		startItemIdx = downItemIdx
+		startLine = m.mouseDownY
+		startCol = m.mouseDownX
+		endItemIdx = dragItemIdx
+		endLine = m.mouseDragY
+		endCol = m.mouseDragX
+	} else {
+		// Backward selection (dragging up)
+		startItemIdx = dragItemIdx
+		startLine = m.mouseDragY
+		startCol = m.mouseDragX
+		endItemIdx = downItemIdx
+		endLine = m.mouseDownY
+		endCol = m.mouseDownX
+	}
+
+	return startItemIdx, startLine, startCol, endItemIdx, endLine, endCol
+}
+
+// selectWord selects the word at the given position within an item.
+func (m *Chat) selectWord(itemIdx, x, itemY int) {
+	item := m.list.ItemAt(itemIdx)
+	if item == nil {
+		return
+	}
+
+	// Get the rendered content for this item
+	var rendered string
+	if rr, ok := item.(list.RawRenderable); ok {
+		rendered = rr.RawRender(m.list.Width())
+	} else {
+		rendered = item.Render(m.list.Width())
+	}
+
+	lines := strings.Split(rendered, "\n")
+	if itemY < 0 || itemY >= len(lines) {
+		return
+	}
+
+	// Adjust x for the item's left padding (border + padding) to get content column.
+	// The mouse x is in viewport space, but we need content space for boundary detection.
+	offset := chat.MessageLeftPaddingTotal
+	contentX := max(x-offset, 0)
+
+	line := ansi.Strip(lines[itemY])
+	startCol, endCol := findWordBoundaries(line, contentX)
+	if startCol == endCol {
+		// No word found at position, fallback to single click behavior
+		m.mouseDown = true
+		m.mouseDownItem = itemIdx
+		m.mouseDownX = x
+		m.mouseDownY = itemY
+		m.mouseDragItem = itemIdx
+		m.mouseDragX = x
+		m.mouseDragY = itemY
+		return
+	}
+
+	// Set selection to the word boundaries (convert back to viewport space).
+	// Keep mouseDown true so HandleMouseUp triggers the copy.
+	m.mouseDown = true
+	m.mouseDownItem = itemIdx
+	m.mouseDownX = startCol + offset
+	m.mouseDownY = itemY
+	m.mouseDragItem = itemIdx
+	m.mouseDragX = endCol + offset
+	m.mouseDragY = itemY
+}
+
+// selectLine selects the entire line at the given position within an item.
+func (m *Chat) selectLine(itemIdx, itemY int) {
+	item := m.list.ItemAt(itemIdx)
+	if item == nil {
+		return
+	}
+
+	// Get the rendered content for this item
+	var rendered string
+	if rr, ok := item.(list.RawRenderable); ok {
+		rendered = rr.RawRender(m.list.Width())
+	} else {
+		rendered = item.Render(m.list.Width())
+	}
+
+	lines := strings.Split(rendered, "\n")
+	if itemY < 0 || itemY >= len(lines) {
+		return
+	}
+
+	// Get line length (stripped of ANSI codes) and account for padding.
+	// SetHighlight will subtract the offset, so we need to add it here.
+	offset := chat.MessageLeftPaddingTotal
+	lineLen := ansi.StringWidth(lines[itemY])
+
+	// Set selection to the entire line.
+	// Keep mouseDown true so HandleMouseUp triggers the copy.
+	m.mouseDown = true
+	m.mouseDownItem = itemIdx
+	m.mouseDownX = 0
+	m.mouseDownY = itemY
+	m.mouseDragItem = itemIdx
+	m.mouseDragX = lineLen + offset
+	m.mouseDragY = itemY
+}
+
+// findWordBoundaries finds the start and end column of the word at the given column.
+// Returns (startCol, endCol) where endCol is exclusive.
+func findWordBoundaries(line string, col int) (startCol, endCol int) {
+	if line == "" || col < 0 {
+		return 0, 0
+	}
+
+	i := displaywidth.StringGraphemes(line)
+	for i.Next() {
+	}
+
+	// Segment the line into words using UAX#29.
+	lineCol := 0 // tracks the visited column widths
+	lastCol := 0 // tracks the start of the current token
+	iter := words.FromString(line)
+	for iter.Next() {
+		token := iter.Value()
+		tokenWidth := displaywidth.String(token)
+
+		graphemeStart := lineCol
+		graphemeEnd := lineCol + tokenWidth
+		lineCol += tokenWidth
+
+		// If clicked before this token, return the previous token boundaries.
+		if col < graphemeStart {
+			return lastCol, lastCol
+		}
+
+		// Update lastCol to the end of this token for next iteration.
+		lastCol = graphemeEnd
+
+		// If clicked within this token, return its boundaries.
+		if col >= graphemeStart && col < graphemeEnd {
+			// If clicked on whitespace, return empty selection.
+			if strings.TrimSpace(token) == "" {
+				return col, col
+			}
+			return graphemeStart, graphemeEnd
+		}
+	}
+
+	return col, col
+}
+
+// abs returns the absolute value of an integer.
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
