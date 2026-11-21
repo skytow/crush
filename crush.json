@@ -4,5 +4,20 @@
     "Go": {
       "command": "gopls"
     }
+  },
+  "providers": {
+    "glm-4.5": {
+      "name": "GLM-4.5 Air (Local)",
+      "base_url": "http://localhost:8001/v1/",
+      "type": "openai",
+      "models": [
+        {
+          "name": "GLM-4.5 Air 4bit",
+          "id": "mlx-community/GLM-4.5-Air-4bit",
+          "context_window": 128000,
+          "default_max_tokens": 8192
+        }
+      ]
+    }
   }
 }
